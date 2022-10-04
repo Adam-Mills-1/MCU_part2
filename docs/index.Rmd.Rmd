@@ -1,0 +1,1234 @@
+---
+title: "MCU Box Office Analysis"
+output:
+  html_document:
+      code_folding: hide
+      df_print: paged
+---
+
+```{r setup, include = FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, error = FALSE)
+
+```
+
+```{r, include = FALSE}
+
+# install Packages
+
+#install.packages("rvest")
+#install.packages("xml2") # scraping
+#install.packages("countrycode")
+
+```
+
+```{r, include = FALSE}
+
+library(rvest)
+library(xml2)
+library(tidyverse)
+library(gridExtra)
+library(lubridate)
+library(hrbrthemes)
+library(png)
+library(GGally)
+library(patchwork)
+library(viridis)
+library(ggrepel)
+library(scales)
+library(countrycode)
+library(sf)
+
+```
+
+```{r, include = FALSE}
+
+wiki_mcu <- read_html("https://en.wikipedia.org/wiki/List_of_Marvel_Cinematic_Universe_films")
+
+wiki_mcu %>% 
+  html_nodes(css = "table")
+
+```
+
+```{r, include = FALSE}
+
+mcu_table <- 
+  wiki_mcu %>% 
+  html_nodes(css = "table") %>% 
+  nth(6) %>% 
+  html_table(fill = TRUE)
+
+head(mcu_table) # Observe first few rows of data
+
+```
+
+```{r, include = FALSE}
+
+# Create data frame from scraped data
+
+mcu <- as.data.frame(mcu_table)
+
+
+# Remove refs column
+
+mcu <- mcu[,-9]
+
+
+# Set names of columns
+
+names(mcu) <- c('Film', 'US_release_date', 'Box_office_US_canada', 'Box_office_other', 'Box_office_world', 'Ranking_US_canada', 
+                       'Ranking_world', 'Budget')
+
+
+# Remove unnecessary rows
+
+mcu <- mcu %>%
+  filter(!row_number() %in% c(1, 2))
+
+
+# Change data type of date
+
+date <- as.Date(mcu$US_release_date, "%b %d, %Y")
+
+
+# Create new phase column
+
+mcu <- mcu %>% 
+  mutate(US_release_date = date) %>%
+  mutate(Phase =  ifelse (US_release_date < "2013-05-03", "1",
+      ifelse (US_release_date >= "2013-05-03" & US_release_date < "2016-05-06", "2",
+              ifelse (US_release_date >= "2016-05-06" & US_release_date < "2021-07-09", "3",
+                      ifelse (US_release_date >= "2021-07-09", "4", NA)))))
+
+
+# Remove original "phase" rows/ headers
+
+mcu <- mcu %>%                 
+  filter(!grepl('Phase', Film))
+
+    
+# Convert box office and budget strings to numeric
+
+mcu <- mcu %>%
+  mutate(across(contains("Box"), gsub, pattern = "[^0-9]", replacement = "")) %>% # Remove non numeric symbols 
+  mutate(across(contains("Box"), as.numeric)) %>%  # Convert to numeric
+  mutate(Budget = gsub("[a-z, $]", "", Budget)) # Remove letters and $ from Budget column
+
+
+Split <- str_split(mcu$Budget,"–|-") # Note: Have to account for 2 different hyphen characters
+Min_Budget <- sapply(Split, "[", 1)
+Max_Budget <- sapply(Split, "[", 2)
+
+
+
+for(i in 1:length(Max_Budget)){
+  ifelse(is.na(Max_Budget[i]) == TRUE, Max_Budget[i] <- Min_Budget[i] , Max_Budget[i] <- Max_Budget[i]) 
+} 
+
+
+mcu <- mcu %>%
+  mutate(Min_Budget = as.numeric(gsub("[^0-9.]", "", Min_Budget)) * 1000000) %>% # Convert to numeric 
+  mutate(Max_Budget = as.numeric(gsub("[^0-9.]", "", Max_Budget)) * 1000000) %>%
+  mutate(Ranking_US_canada = as.numeric(Ranking_US_canada)) %>%
+  mutate(Ranking_world = as.numeric(mcu$Ranking_world)) %>%
+  select(-Budget)
+
+
+mcu[nrow(mcu),"Min_Budget"] <- mcu[28,"Min_Budget"]*1000 #Convert total budgets to billions
+mcu[nrow(mcu),"Max_Budget"] <- mcu[28,"Max_Budget"]*1000
+
+
+# Add Year and Month columns
+
+mcu$Year <- year(as.POSIXlt(mcu$US_release_date, format = "%Y-%m-%d"))
+
+months <- c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
+
+mcu$Month <- months[month(as.POSIXlt(mcu$US_release_date, format = "%Y-%m-%d"))]
+
+
+# Observe data
+
+glimpse(mcu)
+
+```
+
+```{r, include = FALSE}
+
+# Rotten tomatoes data
+
+site <- "https://editorial.rottentomatoes.com/guide/all-marvel-cinematic-universe-movies-ranked/"
+site <- read_html(site)
+
+scores <- html_nodes(site,".tMeterScore") #Used selector gadget via chrome extension
+scores <- html_text(scores)
+
+
+titles <- html_nodes(site,".article_movie_title a")
+titles <- html_text(titles)
+
+
+tomato <- data.frame(Film = titles, tomatometer = scores)
+
+
+
+# IMDB data
+
+site2 <- "https://www.imdb.com/list/ls093312123/?sort=list_order,asc&st_dt=&mode=detail&page=1&title_type=movie&ref_=ttls_ref_typ"
+site2 <- read_html(site2)
+
+scores2 <- html_nodes(site2,".ipl-rating-star.small .ipl-rating-star__rating") # Used selector gadget via chrome extension
+scores2 <- html_text(scores2)
+
+titles2 <- html_nodes(site2,".lister-item-header a")
+titles2 <- html_text(titles2)
+titles2 <- titles2[1:length(scores2)] # Some films may have no score if they are unreleased
+
+
+imdb <- data.frame(Film = titles2, IMDB = scores2)
+
+```
+
+```{r, include = FALSE}
+
+# Filter out sony films not contained in the mcu
+
+imdb <- imdb %>% 
+  filter(!str_detect(Film, "^Venom")) %>%
+  filter(!str_detect(Film, "Morbius")) 
+
+
+# Rename necessary films to make visualisations more readable and naming schemes consistent
+
+tomato$Film <- as.character(tomato$Film)
+
+tomato$Film[25] <- ("Multiverse of Madness") 
+tomato$Film[23] <- ("Age of Ultron")
+tomato$Film[21] <- ("Captain America")
+tomato$Film[15] <- ("Infinity War")
+tomato$Film[12] <- ("The Winter Soldier")
+tomato$Film[10] <- ("Far From Home")
+tomato$Film[8] <- ("The Avengers")
+tomato$Film[6] <- ("Homecoming")
+tomato$Film[9] <- ("Shang-Chi")
+tomato$Film[5] <- ("No Way Home")
+tomato$Film[2] <- ("Endgame")
+
+imdb$Film <- as.character(imdb$Film)
+
+imdb$Film[1] <- ("Endgame")
+imdb$Film[2] <- ("Infinity War")
+imdb$Film[9] <- ("Captain America")
+imdb$Film[10] <- ("The Winter Soldier")
+imdb$Film[11] <- ("Age of Ultron")
+imdb$Film[14] <- ("Homecoming")
+imdb$Film[15] <- ("No Way Home")
+imdb$Film[18] <- ("Shang-Chi")
+imdb$Film[19] <-("Multiverse of Madness")
+imdb$Film[24] <- ("Far From Home")
+imdb$Film[25] <- ("Iron Man 3")
+imdb$Film[26] <- ("Ant-Man and The Wasp")
+
+
+# Revert to factor
+
+imdb$Film <- as.factor(imdb$Film)
+tomato$Film <- as.factor(tomato$Film)
+
+
+# Create ratings dataset by merging rotten tomatoes scores and imdb scores
+
+Ratings <- merge(tomato, imdb, by = "Film") 
+
+
+# Shorten some of the titles in mcu dataset to match with the new names
+
+mcu$Film <- as.character(mcu$Film)
+
+
+mcu[2,1] <- "The Incredible Hulk"
+mcu[5,1] <- "Captain America"
+mcu[6,1] <- "The Avengers"
+mcu[9,1] <- "The Winter Soldier"
+mcu[11,1] <- "Age of Ultron"
+mcu[16,1] <- "Homecoming"
+mcu[19,1] <- "Infinity War"
+mcu[20,1] <- ("Ant-Man and The Wasp")
+mcu[22,1] <- "Endgame"
+mcu[23,1] <- "Far From Home"
+mcu[25,1] <- "Shang-Chi"
+mcu[27,1] <- "No Way Home"
+mcu[28,1] <- "Multiverse of Madness"
+
+# Revert to factor
+
+mcu$Film <- as.factor(mcu$Film)
+
+
+```
+
+```{r, include = FALSE}
+
+mcu <- merge(Ratings, mcu, by = "Film") %>%
+  arrange(US_release_date)
+
+```
+ 
+```{r, include = FALSE}
+
+Approx_budget <- ((mcu$Max_Budget + mcu$Min_Budget)/2)
+
+mcu$Approx_budget <- Approx_budget
+
+```
+
+```{r, include = FALSE}
+
+mcu$Approx_profit <- mcu$Box_office_world-mcu$Approx_budget
+
+```
+
+```{r, include = FALSE}
+
+mcu <- mcu %>%
+  select( - c(Box_office_US_canada, Box_office_other, Ranking_world, Ranking_US_canada ))
+
+
+```
+
+```{r, include = FALSE}
+# Save mcu
+
+saveRDS(mcu, file = "mcu.rds")
+
+mcu <- readRDS(file = "mcu.rds")
+
+mcu
+
+```
+
+
+
+## Part 2 - Exploratory analysis and visualisations
+
+$$\\[0.2in]$$
+
+Note: Please click the "code" icons on the right hand side of the page if you wish to observe the code behind the various figures and tables.
+
+$$\\[0.2in]$$
+
+With out data now cleaned and prepared we can begin to visualise it using various plots.
+
+Here we plot the world-wide box office earnings in US dollars of each film VS. their release date in the United States.
+
+```{r}
+
+ggplot(data = mcu, aes(US_release_date, Box_office_world))+
+  geom_point()+
+  geom_label_repel(label = mcu$Film, size = 3)+
+  scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+  scale_y_continuous(breaks = seq(0, 3000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"))+
+  scale_x_continuous(breaks = mcu$Year)+
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y")+
+  theme_minimal()+
+  theme(axis.title.x=element_blank())+
+  ylab("Box office")
+
+
+```
+
+
+$$\\[0.2in]$$
+
+
+We can also order the films according to their estimated earnings:
+
+```{r}
+mcu %>%
+  select(Film, Box_office_world) %>%
+  arrange(-Box_office_world)
+```
+
+```{r}
+
+ggplot(data = mcu, aes(x = reorder(Film, -Box_office_world), y = Box_office_world))+
+  geom_bar(stat = "identity", fill = "#00BFC4")+
+  scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+  scale_y_continuous(breaks = seq(0, 3000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"))+
+  ylab("Box Office")+
+  xlab("US release date")+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  theme(axis.title.x=element_blank()) 
+  
+
+```
+
+```{r, include = FALSE}
+
+summary(mcu$Box_office_world)
+
+
+ggplot()+ 
+  geom_boxplot(aes(y = mcu$Box_office_world), fill = "#00BFC4", alpha = 0.5)+ 
+  scale_x_discrete( )+
+  scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+  theme_minimal()+ scale_y_continuous(breaks = seq(0, 3000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"))+
+  theme(axis.title.y = element_blank())+
+  labs(title = "Box office boxplot")+
+  theme_minimal()
+
+```
+
+We can clearly observe that the film Endgame has performed by far and away the best with regard to box office, bringing in over two and a half billion dollars. It is followed by Infinity war and No war home earning the studio $2.048 billion and $1.916 billion respectively. The lowest performing MCU film is The Incredible Hulk which brought in just under $265 million at the box office.
+
+
+$$\\[0.2in]$$
+
+
+When we compare the Box office earnings compared to the budget estimations we can note that the money brought in through the box office appears to be consistently more than the money allocated to the film's budgets.
+
+
+```{r}
+
+ggplot(data = mcu, aes(x = US_release_date ))+
+  geom_line(aes(y= Box_office_world, color = "Box_office_world"))+
+  geom_line(aes(y = Max_Budget, color = "Max_Budget"))+
+  geom_line(aes(y = Min_Budget, color = "Min_Budget"))+
+  scale_colour_manual("", 
+                      breaks = c("Box_office_world", "Max_Budget", "Min_Budget"),
+                      values = c("black", "red", "orange"))+
+  scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+  theme_minimal()+ scale_y_continuous(breaks = seq(0, 3000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"))+
+  theme(axis.title.y = element_blank())+
+  xlab("US Release Date")
+  
+  
+  
+```
+
+
+$$\\[0.2in]$$
+
+
+With these figures, we can get a sense of the estimated profit of each film over time.
+
+```{r}
+
+  
+ggplot(data = mcu, aes(x = reorder(Film, US_release_date), y = Approx_profit))+
+  geom_bar(stat = "identity", fill = "#00BFC4")+
+  scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+  scale_y_continuous(breaks = seq(0, 2000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B"))+
+  ylab("Estimated profit")+
+  xlab("US release date")+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  theme(axis.title.x=element_blank()) 
+
+
+
+```
+
+$$\\[0.2in]$$
+
+As such, it would be tempting to conclude that every entry in the franchise has successfully turned a profit for the studio.
+
+However, the estimated profits shown here are almost certainly not realistic figures. Movie studios are notoriously secretive when it comes to the actual amount of money they spend on their products. 
+
+Although the film's estimated "budget" is available in this data, this does not take into account the large amount of money spent on marketing and advertisement. Furthermore, a percentage of any profits made through cinema tickets go directly to the cinema chains that show the pictures.  
+
+A commonly referenced estimate is to multiply the publically availble budget by 2 to get a better sense of the true amount of money a studio has spent on their film.
+
+
+
+$$\\[0.2in]$$
+
+Taking this into account, the following plot is perhaps a more reasonable approximation of film returns.
+
+```{r}
+
+# Create a more realistic profit estimate
+
+mcu$Approx_profit_2 <- mcu$Approx_profit - mcu$Approx_budget
+
+
+# Create a column to check if the release has made or lost money
+
+mcu$In_profit <- ifelse(mcu$Approx_profit_2 > 0, "Yes", "No")
+
+
+# Create plot
+  
+ggplot(data = mcu, aes(x = reorder(Film, US_release_date), y = Approx_profit_2))+
+  geom_bar(stat = "identity", aes(fill = In_profit))+
+  scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+  scale_y_continuous(breaks = seq(0, 2000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B"))+
+  ylab("Estimated profit")+
+  xlab("US release date")+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  theme(axis.title.x=element_blank()) 
+
+
+
+```
+
+
+$$\\[0.1in]$$
+
+
+Summary statistics of the estimated profit:
+
+```{r}
+
+summary(mcu$Approx_profit_2)
+
+```
+
+
+The majority of films are in profit and overall the film franchise has performed exceedingly well, this is unsurprising given how long the mcu has lasted and the impact it has had on popular culture.
+
+The films in this franchise boast a mean estimated profit of over $547 million and a median of over $433 million.
+
+The worst performing entries are those at the very start of the franchise over the first few years from 2008 to 2012 adn those between 2020 and the end of 2021. Two films, "The Incredible Hulk" (2008) and "Black Widow" (2021) may have resulted in a monetary loss. In the case of the latter, this is likely in part due to the restrictions imposed by the covid 19 pandemic. We observe very low earning from the films released during this time.
+
+Note: the film "Eternals" is in profit on the above bar plot but only just.
+
+
+$$\\[0.2in]$$
+
+## Critical response
+
+We can get a sense of the critical response to each entry by visualising the rotten tomato scores and IMDB ratings.
+
+Rotten tomatoes is a review aggregation site that grades films using a percentage scale according to critic reviews. For example, a "fresh" score of 60% indicates that 60% of the critics who reviewed the film/ show reviewed it positively.
+
+IMDB is a large database of information pertaining to media entertainment, mostly movies and shows. IMDB also rates films using a 0 to 10 system.
+
+Here, we arrange the films according to their scores.
+
+
+## {.tabset}
+
+### Rotten tomato scores
+
+
+
+```{r}
+
+# Read rotten tomatoes image
+
+Rotten_tomato_image <- readPNG("C:/Users/Adam/Dropbox/Portfolio/mcu_part_2_images/rt_logo.png", native = TRUE)
+
+mcu$tomatometer <- as.numeric(sub("%","",mcu$tomatometer))/100
+
+
+
+ ggplot(data = mcu, aes(x = reorder(Film, -as.numeric(tomatometer)), y = tomatometer))+
+  geom_bar(stat = "identity", fill = "red")+
+      theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  theme(axis.title.x=element_blank())+
+   scale_y_continuous(NULL, limits = c(0, 1.0), breaks = seq(0, 1, .2),
+                        labels = function(x) scales::percent(x),
+                        expand = c(0, 0))+
+      geom_text(aes(label = paste0(tomatometer*100,"%")),
+                size = 5, 
+                hjust = 1.2,
+                col = "white",
+                angle = 90)+
+  inset_element(p = Rotten_tomato_image,   # Combine with image
+                left = 0.85,
+                bottom = 0.75,
+                right = 1,
+                top = 1)
+
+  
+
+```
+
+
+```{r}
+
+ # ggplot(data = mcu, aes(x = reorder(Film, US_release_date), y = tomatometer, group = 1))+
+ #  geom_line(color = "#00BFC4")+
+ #   expand_limits(y = c(0,1))+
+ #   geom_text(aes(label = percent(tomatometer)),
+ #                   size = 3, vjust = -0.01) +
+ #   scale_y_continuous(NULL, limits = c(0, 1.0), breaks = seq(0, 1, .2),
+ #                        labels = function(x) scales::percent(x),
+ #                        expand = c(0, 0)) +
+ #  theme_minimal()+
+ #  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+ #  theme(axis.title.x=element_blank())
+
+```
+
+
+
+```{r}
+
+ # ggplot(data = mcu, aes(x = reorder(Film, US_release_date), y = tomatometer, group = 1))+
+ #  geom_line(color = "#00BFC4")+
+ #   expand_limits(y = c(0,1))+
+ #   scale_y_continuous(NULL, limits = c(0, 1.0), breaks = seq(0, 1, .2),
+ #                        labels = function(x) scales::percent(x),
+ #                        expand = c(0, 0)) +
+ #  geom_label_repel(aes(label = percent(tomatometer)), nudge_x = 0.35, size = 2.5)+
+ #  theme_minimal()+
+ #  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+ #  theme(axis.title.x=element_blank())#Remove x axis label
+
+
+
+
+```
+
+
+### IMDB 
+
+```{r}
+
+# Read IMDB image
+
+IMDB_logo <- readPNG("C:/Users/Adam/Dropbox/Portfolio/mcu_part_2_images/IMDB_logo.png", native = TRUE)
+
+mcu$IMDB <- as.double(as.character(mcu$IMDB))
+
+
+
+
+ggplot(data = mcu, aes(x = reorder(Film, -IMDB), y = IMDB))+
+  geom_bar(stat = "identity", fill = "orange")+
+  expand_limits(y = c(0,10))+
+  ylab("Score")+
+  geom_text(aes(label = IMDB), 
+            hjust = 1.5, 
+            colour = "white",
+            size = 5,
+            angle = 90)+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        axis.title.x=element_blank())+
+  inset_element(p = IMDB_logo,   # Combine with image
+                left = 0.65,
+                bottom = 0.75,
+                right = 1.1,
+                top = 1)
+
+```
+
+$$\\[0.2in]$$
+
+##
+
+###  Scores over time
+
+
+```{r}
+
+
+ggplot(mcu, aes(x = reorder(Film, US_release_date))) +
+  geom_line( aes(y = tomatometer, group = 1), color = "Red") + 
+  geom_line( aes(y = IMDB / 10, group = 1), color = "orange") + 
+  scale_y_continuous(name = "Tomatometer", labels = function(x) scales::percent(x), sec.axis = sec_axis(~.*10, name="IMDB score"))+
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+        ,axis.title.y = element_text(color = "red", size=13, vjust = 3)
+        ,axis.title.y.right = element_text(color = "orange", size=13, vjust = 3))+
+  theme(axis.title.x=element_blank())
+  
+```
+
+$$\\[0.1in]$$
+
+Summary statistics for the tomatometer:
+
+```{r}
+
+summary(mcu$tomatometer)
+
+```
+
+Summary statistics for IMDB scores: 
+
+```{r}
+
+summary(mcu$IMDB)
+
+```
+
+
+The ratings are generally quite high with a mean tomatometer of 83%. This means that 83% of critics considered the film to be good.
+
+Interestingly, the IMDB scores seem to be generally a bit lower that their tomatometer counterparts. Although they are still relatively high. The mean IMDB score is 7.4/10.
+
+The film with the highest IMDB score is "Avengers Endgame". The highest rated film on rotten tomatoes is "Black Panther" which won three Oscars in 2019 and was nominated for best picture. Both sites have "Eternals scorring the lowest with 47% and 6.3 on rotten tomatoes and IMDB respectively.  
+
+
+$$\\[0.2in]$$
+
+### Critical reception & box office
+
+We can also superimpose the critical performance onto the performence at the box office as well as calculate a correlation between the two.
+
+##  {.tabset}
+
+### Rotten tomatoes
+
+
+```{r}
+
+
+ggplot(mcu, aes(x = reorder(Film, US_release_date))) +
+  
+    geom_col( aes(y = Box_office_world, group = 1), fill = "#00BFC4")+
+  geom_line( aes(y = tomatometer*2000000000 , group = 1), color = "Red") +
+  
+  scale_y_continuous( name = "Box office", breaks = seq(0, 3000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"),
+                     sec.axis = sec_axis(~./2000000000, name = "Tomatometer", labels = function(x) scales::percent(x)))+
+  
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+        ,axis.title.y = element_text(color = "#00BFC4", size=13)
+        ,axis.title.y.right = element_text(color = "red", size=13, vjust = 3))+
+  theme(axis.title.x=element_blank())
+
+
+```
+
+Correlation between box office and tomatometer:
+
+```{r}
+
+cor(mcu$Box_office_world, mcu$tomatometer)
+
+```
+There appears to be a moderate positive correlation between the rotten tomato ratings and the film's performance at the box office
+
+$$\\[0.2in]$$
+
+### IMDB
+
+
+```{r}
+
+ggplot(mcu, aes(x = reorder(Film, US_release_date))) +
+  
+    geom_col( aes(y = Box_office_world, group = 1), fill = "#00BFC4")+
+  geom_line( aes(y = IMDB*200000000 , group = 1), color = "orange") +
+  
+  scale_y_continuous( name = "Box office", breaks = seq(0, 3000000000, by = 500000000), 
+                     labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"),
+                     sec.axis = sec_axis(~./200000000, name = "IMDB"))+
+  
+  theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)
+        ,axis.title.y = element_text(color = "#00BFC4", size=13)
+        ,axis.title.y.right = element_text(color = "orange", size=13))+
+  theme(axis.title.x=element_blank())
+
+```
+
+Correlation between box office and IMDB score:
+
+```{r}
+
+cor(mcu$Box_office_world, mcu$IMDB)
+
+```
+We see a strong positive correlation between IMDB score and monmey brought in at the box office. Interestingly, this correlation is a bit stronger then that of Rotten Tomatoes.
+
+$$\\[0.2in]$$
+
+
+## Cumulative earnings
+
+$$\\[0.1in]$$
+
+We'll now take a look at the cumulative profits generated by the mcu.
+
+The mcu is divided up temporally into various phases, to aid in our visualisation, we will make a dataframe containing that phase data. 
+
+```{r}
+
+phase <- data.frame(start = as.Date(c("2008-05-02", "2013-05-03", "2016-05-06", "2021-07-09"), format =  "%Y-%m-%d"),  
+                    end = as.Date(c("2013-05-03", "2016-05-06", "2021-07-09", "2023-02-01"), format = "%Y-%m-%d"),
+                    Phase = factor(1:4))
+
+phase
+
+
+```
+
+
+
+
+```{r}
+
+# Animation:
+
+# Add approximate cumulative earning to data
+
+mcu$cumu_profits <- cumsum(mcu$Approx_profit_2)
+
+
+# Load libraries:
+
+library(ggplot2)
+library(gganimate)
+
+
+# Create plot
+
+cum_prof <- ggplot() + 
+  geom_rect(data = phase,  aes(xmin=start, xmax = end, 
+                 ymin = -Inf, ymax = Inf, 
+                 fill = Phase), alpha = 0.5)+
+  scale_fill_viridis(discrete = TRUE, option = "C")+
+  geom_point(data = mcu, aes(US_release_date, cumu_profits))+
+  geom_line(data = mcu, aes(US_release_date, cumu_profits))+
+  scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-10, accuracy = 0.5))+
+  scale_y_continuous(breaks = seq(0, 20000000000, by = 5000000000), 
+                     labels = c(0,"5 B", "10 B", "15 B", "20 B"))+
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  ylab("Cummulative profits")+
+  xlab(NULL)+
+  theme_minimal()
+
+
+# Generate animation using release date
+
+mcu_cum_prof <-
+  cum_prof+
+  transition_reveal(US_release_date)
+
+
+# Save at gif
+
+anim_save("mcu_cum_prof.gif", mcu_cum_prof)
+
+
+# Observe animation
+
+mcu_cum_prof
+
+```
+
+
+$$\\[0.2in]$$
+
+We see a relatively slow start with profits picking up after the first Avengers film in 2012. Then we observer a consistent increase during phase 2. During phase 3 we initially see massive increase in box office as the cumulative profits surpass $12.5 billion. It appears that the large ensemble movies released toward the end of a certain phase tend to perform exceedingly well, in particular "Avengers Endgame" which acted as a conclusion to the initial 3 phases.
+
+We then see significant stagnation in profits during the 2020 pandemic. During this period of time the studio did not release any new films. Coming out of the pandemic we observe relatively low performance perhaps due to audiences reluctant to return to the cinema. 
+
+There is a significant uptick in box office in December 2021 with the release of "Spiderman: No Way Home". the film brought in close to $2 billion dollars and is the 6th highest grossing film of all time (not adjusted for inflation). We then see somewhat reasonable/ standard performances from the two releases since then.
+
+
+
+$$\\[0.2in]$$
+
+
+
+
+## Box office over years and months
+
+We can use our data to examine the mean box office over each year and each month.
+
+```{r}
+
+mcu_year <- mcu %>% 
+              group_by(Year) %>%
+              summarise(Mean_box_office = mean(Box_office_world))
+
+mcu_month <- mcu %>% 
+              group_by(Month) %>%
+              summarise(Mean_box_office = mean(Box_office_world))
+
+
+mcu_year; mcu_month
+
+
+```
+
+
+
+## {.tabset}
+
+### Yearly releases
+
+```{r}
+
+Releases_per_year <- ggplot(data = (mcu %>%count(Year)), aes(x = Year, y = n) )+
+                      geom_bar(stat = "identity", fill = "#00BFC4")+
+                        scale_x_continuous(breaks=2008:2022)+
+                        theme_minimal()+
+                        ggtitle("Releases per year")+
+                        theme(plot.title = element_text(hjust = 0.5),
+                        axis.title.y = element_blank(),
+                        axis.text.y = element_blank(),
+                        axis.title.x = element_blank(),
+                        plot.margin = unit(c(1,-1,1,0), "mm"))+
+                        scale_y_reverse()+
+                        coord_flip()
+
+
+Mean_box_ofice_year <- ggplot(data = mcu_year, aes(x = Year, y = Mean_box_office))+
+                        geom_bar(stat = "identity", fill = "#00BFC4")+                        
+                        scale_x_continuous(breaks=2008:2022)+
+                        scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+                        scale_y_continuous(breaks = seq(0, 3000000000, by = 500000000), 
+                                           labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"))+
+                        ylab("Box Office")+
+                        theme_minimal()+
+                        ggtitle("Mean box ofice per year") +
+                        theme(plot.title = element_text(hjust = 0.5),
+                        axis.title.x = element_blank(),
+                        axis.title.y = element_blank(),
+                        plot.margin = unit(c(1,-1,1,0), "mm"))+
+                        coord_flip()
+
+
+grid.arrange(Releases_per_year, Mean_box_ofice_year, ncol = 2)
+
+```
+
+We can see that 2009 and 2020 were the only two years when the studio did not release a film. It appears the the studio may be gradually increasing the number of movies released per year. From 2008 to 2016 we see one or two releases and over the next three years there are three releases each year. The most films released over a single year was 4 in 2021. 2012 and 2019 were the most successful years with regard to mean box office, likely due to the release of "The Avengers" and "Endgame" which performed very well.
+
+
+$$\\[0.2in]$$
+
+
+### Monthly releases
+
+```{r}
+
+# Create dataframe containing total number of films for each month
+
+month_count <- mcu %>% count(Month)
+               
+
+# Create abbreviated month data frame 
+
+month_abv <- data.frame(Month = c("Jan","Feb","Mar","Apr","May","Jun", "Jul","Aug","Sep","Oct", "Nov", "Dec"))
+
+
+# Add missing months 
+
+month_modified <- left_join(month_abv, month_count, by = "Month") 
+
+ 
+# Replace coerced NAs with 0 
+
+month_modified <- month_modified %>%
+  mutate(n = ifelse(is.na(n),0,n)) %>%
+  mutate(Month = factor(Month, levels = c("Jan","Feb","Mar","Apr","May","Jun", "Jul","Aug","Sep","Oct", "Nov", "Dec")))
+
+
+# Create plot
+
+month_plot <- ggplot(month_modified, aes(x = Month, y = n)) +
+                geom_bar(stat = "identity", fill = "#00BFC4")+
+                scale_y_reverse()+
+                ggtitle("Releases per month")+
+                theme_minimal()+
+                theme(plot.title = element_text(hjust = 0.5),
+                      axis.title.y = element_blank(),
+                      axis.text.y = element_blank(),
+                      axis.title.x = element_blank())+
+                coord_flip() +
+                scale_y_reverse()
+
+
+
+
+
+# Mean box office per month
+
+# Add missing months 
+
+month_modified_mean <- left_join(month_abv, mcu_month, by = "Month") 
+
+# Replace coerced NAs with 0 
+
+month_modified_mean <- month_modified_mean %>%
+  mutate(Mean_box_office = ifelse(is.na(Mean_box_office),0,Mean_box_office)) %>%
+  mutate(Month = factor(Month, levels = c("Jan","Feb","Mar","Apr","May","Jun", "Jul","Aug","Sep","Oct", "Nov", "Dec")))
+
+
+# Create plot
+
+month_mean_plot <- ggplot(month_modified_mean, aes(x = Month, y = Mean_box_office)) +
+                geom_bar(stat = "identity", fill = "#00BFC4")+
+                ggtitle("Mean box office")+
+                        scale_y_continuous(labels = unit_format(unit = "B", scale = 1e-9, accuracy = 0.5))+
+                        scale_y_continuous(breaks = seq(0, 3000000000, by = 500000000), 
+                                           labels = c(0,"500 M", "1 B", "1.5 B", "2 B", "2.5 B", "3 B"))+
+                theme_minimal()+
+                theme(plot.title = element_text(hjust = 0.5),
+                      axis.title.y = element_blank(),
+                      axis.title.x = element_blank())+
+                coord_flip()
+
+
+          
+# Combine plots
+
+
+grid.arrange(month_plot, month_mean_plot, ncol=2)
+
+```
+
+Marvel studios tends to prefer the Summer months releasing 9 of its 29 films in May and 7 in July.
+
+It has yet to release a film in October or in January. January is often regarded as a "dump" zone for movies anticipated to perform badly, this is due in part to the timing of award events such as the Oscars which airs around February. Studios are often reluctant to release big budget or highly anticipated movies in January.
+
+We observe the highest mean box office performances in April and  December. The three April releases have been "The Winter Soldier", "Infinity war" and "Endgame", all of which performed well financially and critically. The high mean box office seen in December is due to the performance of "Spiderman: No Way Home"(2021).
+
+
+
+$$\\[0.2in]$$
+
+
+## Correlation
+
+
+
+```{r}
+
+# Create correlation matrix
+
+select(mcu, - c(Film, US_release_date, In_profit, Phase, Month, Min_Budget, Max_Budget, cumu_profits, Approx_profit, Approx_profit_2))%>%
+ggpairs()
+
+```
+
+$$\\[0.2in]$$
+
+
+In the above correlation matrix, we observe a moderate to strong positive correlation between the world wide box office and the approximate budget, between the IMBD rating and the box office and also, unsurprisingly between the IMDB rating and tomatometer score.
+
+There is a weak to moderate positive correlation between the box office and the tomatometer score, the approximate budget and the IMDB rating as well as the year of release with the budget and box office.
+
+There is an extremely slight negative correlation between year of release and critical reception (i.e. both the tomatometer and imbd scores).
+
+
+$$\\[0.2in]$$
+
+
+## Linear models
+
+
+### Budget
+
+Is there statistical evidence to say that the budget of these films significantly affects their performance at the box office?
+
+To test this, we will perform a simple linear regression using the following model:
+
+$$\\[0.1in]$$
+
+
+$$y = \beta_0 + \beta_1x_1 + \epsilon$$
+
+$$\\[0.1in]$$
+
+where $y$ is the box office,
+$\beta_0$ is the intercept,
+$\beta_1$ is the slope,
+$x_1$ is the approximate budget and
+$\epsilon$ is the error term.
+
+The null hypothesis is that there is no relationship between the predictor variable budget and the response variable box office.
+The alternate hypothesis is there is a significant relationship between these variables.
+
+$$\\[0.1in]$$
+
+$$\begin{array}{ccc}
+H_0: \beta_1  = 0\\
+H_1: \beta_1  \not = 0
+\end{array}$$
+
+
+
+
+
+
+```{r}
+
+ggplot(mcu, aes(Approx_budget, Box_office_world))+
+  geom_point()+
+  geom_smooth(method='lm')
+
+```
+
+
+```{r}
+
+# Create linear model
+
+lm_bud <- lm(Box_office_world ~ Approx_budget, data = mcu) 
+
+
+#Review the results
+
+summary(lm_bud) 
+
+```
+$$\\[0.1in]$$
+
+
+The p value associated with the variable "Approx_budget" is less that alpha = 0.05 and therefore we reject the null hypothesis and conclude that there is evidence of a statistically significant relationship between the budget of a mcu film and it's box office returns.
+
+
+$$\\[0.2in]$$
+
+### Multiple linear regression
+
+Let's add some more predictors to the model:
+
+```{r}
+
+# Create model
+
+lm_multi <- lm(Box_office_world ~ Approx_budget + IMDB + Year , data = mcu) 
+
+
+# Review the results
+
+summary(lm_multi) 
+
+```
+
+$$\\[0.1in]$$
+
+Now along with "Approx_budegt", we are also including "IMDB" scores and the "Year" of release in the new model.
+
+The Year term here has a p-value of 0.27617 which is greater than alpha = 0.05. This means there is not enough evidence to conclude that their is a significant relationship between year of release and box office return. 
+
+We can remove the predictor from our model.
+
+```{r}
+# Create model
+
+lm_multi_2 <- lm(Box_office_world ~ Approx_budget + IMDB , data = mcu) 
+
+
+# Review the results
+
+summary(lm_multi_2) 
+
+```
+
+Approximate budget and IMDB scores are both significant in this model.
+
+The model is:
+
+$$y = \beta_0 + \beta_1x_1 + \beta_2x_2 + \epsilon$$
+where,
+
+$y$ is the box office,
+$x_1$ is the approximate budget,
+$x_2$ is the IMDB score, 
+$\beta_0$ is the intercept i.e. the box office value when all other parameters are 0,
+$\beta_1$ is the estimated change in the mean response box office per one unit change in budget when all other predictors remain constant,
+$\beta_2$ is the estimated change in the mean response box office per one unit change in IMDB score when all other predictors remain constant,
+$\epsilon$ is the error term.
+
+The null hypothesis is:
+
+$H_0: \beta_1  = \beta_2 = 0$
+
+The alternative hypothesis is that at least one $\beta_i \not = 0$
+
+Interpretation:
+
+The above model gives us the following equation
+
+Estimated box office = -3.257e+8 + 5.434 Approx Budget + 2.244e+8 IMDB
+
+When the budget and IMDB score are both 0 the box_office would be $-3.257e+8. Of course, although this may work for the model, in reality it does not have a practical interpretation. 
+
+An increase of 1 US dollar to the approximate budget yields an increase of 5.434 dollars to the world-wide box office when the IMDB rating remains the same. 
+
+An increase of one unit to the IMDB score yields an increase of 224,400,000 dollars to the box office when the budget remains fixed.
+
+
+$$\\[0.8in]$$
+
+
+```{r, include = FALSE}
+
+par(mfrow=c(2,2))
+
+plot(lm_bud)
+
+```
+```{r, include = FALSE}
+lm_bud
+
+library(car)
+
+residualPlots(lm_bud ,ylab="Residuals", tests=F)
+
+```
+
+```{r, include = FALSE}
+avPlots(lm_bud)
+```
+
+```{r, include = FALSE}
+crPlots(lm_bud)
+```
+
+```{r, include = FALSE}
+plot(mcu$Box_office_world, lm_bud$fit, ylab="fitted values",xlab="cmpg")
+lines(lowess(mcu$Box_office_world, lm_bud$fit), col="red")
+
+```
+```{r, include = FALSE}
+bf=boxCox(lm_bud)
+
+```
+```{r, include = FALSE}
+bf$x[which.max(bf$y)]
+```
+```{r, include = FALSE}
+lm_2 <- lm(Box_office_world^{1/3} ~ Approx_budget, data = mcu)
+
+summary(lm_2)
+```
+```{r, include = FALSE}
+lm3 <- lm(Box_office_world ~ I(Approx_budget^2), data = mcu)
+
+residualPlots(lm3 ,ylab="Residuals", tests=F)
+```
+
+```{r, include = FALSE}
+summary(lm3)
+```
+```{r, include = FALSE}
+crPlots(lm3)
+```
+
+```{r, include = FALSE}
+lm4 <- lm(Box_office_world ~ 0 + Approx_budget, data = mcu)
+
+summary(lm4)
+
+plot(lm4)
+
+
+
+```
+
+
+$$\\[0.8in]$$
